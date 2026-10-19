@@ -1,93 +1,115 @@
+"""FastAPI application exposing the trained mushroom classifier."""
+
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
-from app import ml
-from app.schemas import Mushroom, MushroomPrediction
-from typing import Annotated
-from fastapi import Body
-from app.schemas import ChurnPrediction, Customer, Feedback, ModelInfo, SentimentPrediction
+from typing import Annotated, Any
 
-MODELS: dict[str, dict | None] = {}
-HOW_TO_TRAIN = {"churn": "python train_churn.py", "sentiment": "python train_sentiment.py", "mushroom": "python train_mushroom.py"}
+from fastapi import Body, FastAPI, HTTPException, Request
+
+from app import __version__, ml
+from app.schemas import (
+    HealthResponse,
+    ModelInfo,
+    MushroomFeatures,
+    MushroomPrediction,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    for name in HOW_TO_TRAIN:
-        MODELS[name] = ml.load(name)
+    """Load the model once when the API starts."""
+    try:
+        app.state.bundle = ml.load_bundle()
+        app.state.model_error = None
+    except (FileNotFoundError, ValueError) as exc:
+        app.state.bundle = None
+        app.state.model_error = str(exc)
     yield
-    MODELS.clear()
+    app.state.bundle = None
 
 
 app = FastAPI(
-    title="Mushroom, churn & sentiment API",
-    description="Classroom ML predictions, including edible/poisonous mushroom classification. Educational use only; do not use to decide whether to eat a mushroom.",
-    version="1.0.0",
+    title="Mushroom Classification API",
+    description=(
+        "Predict whether a mushroom is edible or poisonous from 22 categorical "
+        "characteristics. Educational use only—never use this API to decide whether "
+        "a wild mushroom is safe to eat."
+    ),
+    version=__version__,
     lifespan=lifespan,
 )
 
 
-def model(name: str) -> dict:
-    """The loaded model, or a clear error if it has not been trained yet."""
-    bundle = MODELS.get(name)
+def get_bundle(request: Request) -> dict[str, Any]:
+    """Return the loaded bundle or a useful service-unavailable response."""
+    bundle = getattr(request.app.state, "bundle", None)
     if bundle is None:
-        hint = f"The {name} model is not trained yet: run `{HOW_TO_TRAIN[name]}`."
-        raise HTTPException(status_code=503, detail=hint)
+        detail = getattr(request.app.state, "model_error", None) or (
+            "The model is unavailable. Run `python mushroom_train.py`."
+        )
+        raise HTTPException(status_code=503, detail=detail)
     return bundle
 
 
 @app.get("/", include_in_schema=False)
-def home() -> dict:
-    return {"message": "Churn & sentiment API", "docs": "/docs", "health": "/health"}
+def home() -> dict[str, str]:
+    return {
+        "name": "Mushroom Classification API",
+        "docs": "/docs",
+        "health": "/health",
+        "model": "/models",
+    }
 
 
-@app.get("/health", tags=["service"])
-def health() -> dict:
-    return {"status": "ok", "models": {name: bundle is not None for name, bundle in MODELS.items()}}
+@app.get("/health", response_model=HealthResponse, tags=["service"])
+def health(request: Request) -> dict[str, Any]:
+    loaded = getattr(request.app.state, "bundle", None) is not None
+    return {"status": "ok" if loaded else "degraded", "model_loaded": loaded}
 
 
-@app.get("/models", response_model=list[ModelInfo], tags=["service"])
-def models() -> list[dict]:
-    """Which models are loaded, how they were trained and how well they scored."""
-    return [
-        {"name": name, "loaded": False}
-        if bundle is None
-        else {
-            "name": name,
-            "loaded": True,
-            "algorithm": bundle["algorithm"],
-            "trained_at": bundle["trained_at"],
-            "metrics": bundle["metrics"],
-        }
-        for name, bundle in MODELS.items()
-    ]
+@app.get("/models", response_model=ModelInfo, tags=["service"])
+def model_info(request: Request) -> dict[str, Any]:
+    bundle = get_bundle(request)
+    return {
+        "name": "mushroom",
+        "algorithm": bundle["algorithm"],
+        "features": bundle["features"],
+        "threshold": bundle["threshold"],
+        "metrics": bundle["metrics"],
+        "trained_at": bundle["trained_at"],
+        "sklearn_version": bundle["sklearn_version"],
+    }
 
 
-@app.post("/churn/predict", response_model=ChurnPrediction, tags=["churn"])
-def predict_churn(customer: Customer) -> dict:
-    """Will this customer leave?"""
-    return ml.predict_churn(model("churn"), [customer.model_dump()])[0]
+@app.post(
+    "/predict",
+    response_model=MushroomPrediction,
+    tags=["prediction"],
+    summary="Classify one mushroom",
+)
+@app.post(
+    "/mushroom/predict",
+    response_model=MushroomPrediction,
+    tags=["prediction"],
+    include_in_schema=False,
+)
+def predict_mushroom(
+    mushroom: MushroomFeatures, request: Request
+) -> dict[str, Any]:
+    record = mushroom.model_dump(by_alias=True)
+    return ml.predict_mushrooms(get_bundle(request), [record])[0]
 
 
-
-@app.post("/sentiment/predict", response_model=SentimentPrediction, tags=["sentiment"])
-def predict_sentiment(feedback: Feedback) -> dict:
-    """Is this feedback negative, neutral or positive?"""
-    return ml.predict_sentiment(model("sentiment"), [feedback.text])[0]
-
-
-
-@app.post("/mushroom/predict", response_model=MushroomPrediction, tags=["mushroom"])
-def predict_mushroom(mushroom: Mushroom) -> dict:
-    """Classify category codes from the Kaggle dataset. Educational use only."""
-    return ml.predict_mushroom(model("mushroom"), [mushroom.model_dump(by_alias=True)])[0]
-
-
-@app.post("/mushroom/predict/batch", response_model=list[MushroomPrediction], tags=["mushroom"])
+@app.post(
+    "/predict/batch",
+    response_model=list[MushroomPrediction],
+    tags=["prediction"],
+    summary="Classify up to 1,000 mushrooms",
+)
 def predict_mushroom_batch(
-    mushrooms: Annotated[list[Mushroom], Body(min_length=1, max_length=1000)],
-) -> list[dict]:
-    return ml.predict_mushroom(
-        model("mushroom"), [item.model_dump(by_alias=True) for item in mushrooms]
-    )
+    mushrooms: Annotated[list[MushroomFeatures], Body(min_length=1, max_length=1000)],
+    request: Request,
+) -> list[dict[str, Any]]:
+    records = [item.model_dump(by_alias=True) for item in mushrooms]
+    return ml.predict_mushrooms(get_bundle(request), records)
