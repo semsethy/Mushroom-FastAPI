@@ -1,0 +1,1 @@
+"""Mushroom prediction API package."""
