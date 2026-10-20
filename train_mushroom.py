@@ -1,237 +1,170 @@
-"""Train a Random Forest that classifies mushrooms as edible or poisonous.
+from __future__ import annotations
 
-EDUCATIONAL PROTOTYPE ONLY. This is not a certified food-safety system.
-A low predicted probability of toxicity never guarantees a mushroom is safe.
-
-Usage:  python train_mushroom.py
-"""
-
+import argparse
+from datetime import UTC, datetime
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
+import sklearn
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
-    classification_report,
     confusion_matrix,
     f1_score,
     precision_score,
     recall_score,
+    roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
+from sklearn.model_selection import (
+    StratifiedKFold,
+    cross_val_predict,
+    cross_val_score,
+    train_test_split,
+)
+from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OneHotEncoder
+from sklearn.tree import DecisionTreeClassifier
 
-# --- Configuration (all tunables in one place) ------------------------------
+HERE = Path(__file__).parent
+DATA = HERE / "data" / "mushroom" / "mushrooms.csv"
+MODELS = HERE / "models"
 
-BASE_DIR = Path(__file__).resolve().parent
-
-# Prefer data/mushrooms.csv; fall back to the copy already in the repo.
-DATA_PATH = next(
-    (
-        p
-        for p in [
-            BASE_DIR / "data" / "mushrooms.csv",
-            BASE_DIR / "data" / "mushroom" / "mushrooms.csv",
-        ]
-        if p.is_file()
-    ),
-    None,
-)
-
-MODELS_DIR = BASE_DIR / "models"
-TARGET = "class"
-
-TEST_SIZE = 0.20
-RANDOM_SEED = 42
-N_ESTIMATORS = 150
-
-# Business rule: reject as poisonous unless P(poisonous) is below this value.
-# This is a risk setting, not a safety certification.
-POISONOUS_THRESHOLD = 0.05
+TARGET = "class"  # e = edible, p = poisonous
+ALGORITHMS = ["logistic regression", "decision tree", "random forest"]
 
 
-# --- Data -------------------------------------------------------------------
-
-def load_data() -> pd.DataFrame:
-    """Load and validate the mushroom CSV."""
-    if DATA_PATH is None:
-        raise FileNotFoundError(
-            "Dataset not found. Expected data/mushrooms.csv or "
-            "data/mushroom/mushrooms.csv next to this script."
-        )
-
-    df = pd.read_csv(DATA_PATH)
-    print(f"Loaded {DATA_PATH.relative_to(BASE_DIR)}: {df.shape}")
-
-    if TARGET not in df.columns:
-        raise ValueError(f"Column '{TARGET}' not found. Columns: {list(df.columns)}")
-
-    labels = set(df[TARGET].unique())
-    if labels != {"e", "p"}:
-        raise ValueError(f"Expected labels 'e' and 'p', found: {sorted(labels)}")
-
-    # '?' marks unknown values (in stalk-root); treat it as missing.
-    if df.eq("?").any().any():
-        counts = df.eq("?").sum()
-        print(f"Missing-value marker '?': {counts[counts > 0].to_dict()}")
-        df = df.replace("?", np.nan)
-
-    print(f"Class balance: {df[TARGET].value_counts().to_dict()}")
-    return df
+def step(title: str) -> None:
+    print(f"\n=== {title} " + "=" * max(0, 60 - len(title)))
 
 
-# --- Model ------------------------------------------------------------------
-
-def build_pipeline(feature_columns: list[str]) -> Pipeline:
-    """One-hot encode the categorical features, then train a Random Forest."""
-    preprocessor = ColumnTransformer(
-        transformers=[
-            # handle_unknown="ignore" lets inference accept unseen codes.
-            ("cat", OneHotEncoder(handle_unknown="ignore"), feature_columns)
-        ]
-    )
-    model = RandomForestClassifier(
-        n_estimators=N_ESTIMATORS, random_state=RANDOM_SEED, n_jobs=-1
-    )
-    return Pipeline([("preprocessor", preprocessor), ("model", model)])
-
-
-def predict_poisonous(pipeline: Pipeline, X: pd.DataFrame):
-    """Return (probabilities, 'e'/'p' decisions) using the business rule."""
-    # Find the poisonous column by checking the fitted class order.
-    classes = list(pipeline.named_steps["model"].classes_)
-    proba = pipeline.predict_proba(X)[:, classes.index(1)]
-    decisions = np.where(proba < POISONOUS_THRESHOLD, "e", "p")
-    return proba, decisions
-
-
-# --- Evaluation -------------------------------------------------------------
-
-def evaluate_model(pipeline: Pipeline, X_test, y_test) -> dict:
-    """Evaluate on the held-out test set using business error terms."""
-    _, decisions = predict_poisonous(pipeline, X_test)
-    y_pred = (decisions == "p").astype(int)  # poisonous = positive class
-
-    tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel()
-    results = {
-        "accuracy": accuracy_score(y_test, y_pred),
-        "precision": precision_score(y_test, y_pred),
-        "recall": recall_score(y_test, y_pred),
-        "f1": f1_score(y_test, y_pred),
-        # Business false positive: poisonous predicted edible (dangerous).
-        "dangerous_edible_approvals": int(fn),
-        # Business false negative: edible predicted poisonous (unnecessary).
-        "unnecessary_rejections": int(fp),
-        "approved_edible": int(tn + fn),
-        "rejected_poisonous": int(tp + fp),
-        "total": len(y_test),
+def candidates() -> dict:
+    """The three models from the notebook. One-hot encoding sits inside each pipeline, so the
+    encoder is fitted on training folds only and the saved model takes the raw letter codes."""
+    return {
+        "logistic regression": make_pipeline(
+            OneHotEncoder(handle_unknown="ignore"),
+            LogisticRegression(max_iter=2000, random_state=42),
+        ),
+        "decision tree": make_pipeline(
+            OneHotEncoder(handle_unknown="ignore"),
+            DecisionTreeClassifier(random_state=42),
+        ),
+        "random forest": make_pipeline(
+            OneHotEncoder(handle_unknown="ignore"),
+            RandomForestClassifier(n_estimators=150, random_state=42, n_jobs=1),
+        ),
     }
 
-    print(f"\nThreshold: reject when P(poisonous) >= {POISONOUS_THRESHOLD}")
-    print(f"Accuracy:               {results['accuracy']:.6f}")
-    print(f"Precision (poisonous):  {results['precision']:.6f}")
-    print(f"Recall (poisonous):     {results['recall']:.6f}")
-    print(f"F1-score (poisonous):   {results['f1']:.6f}")
 
-    print("\nConfusion matrix (rows = actual, cols = predicted):")
-    print(
-        pd.DataFrame(
-            confusion_matrix(y_test, y_pred, labels=[0, 1]),
-            index=["actual edible", "actual poisonous"],
-            columns=["pred edible", "pred poisonous"],
-        ).to_string()
-    )
+def train(
+    data_path: Path = DATA,
+    models_dir: Path = MODELS,
+    algorithm: str | None = None,
+    verbose: bool = True,
+) -> dict:
+    say = print if verbose else (lambda *args, **kwargs: None)
+    show = step if verbose else (lambda title: None)
 
-    print("\nClassification report:")
-    print(
-        classification_report(
-            y_test, y_pred, target_names=["edible", "poisonous"], digits=4
-        )
-    )
+    show("1. Load and check the data")
+    df = pd.read_csv(data_path)
+    features = df.columns.drop(TARGET).tolist()
+    say(f"{len(df)} mushrooms, {len(features)} features (all one-letter category codes)")
+    say(f"duplicate rows: {df.duplicated().sum()}, empty cells: {int(df.isna().sum().sum())}")
+    say(f"'?' (unknown) in stalk-root: {df['stalk-root'].eq('?').sum()} -> kept as its own category")
+    say(f"poisonous: {df[TARGET].eq('p').mean():.1%} -> the classes are balanced")
 
-    total = results["total"]
-    print("Business error summary")
-    print(
-        f"  Dangerous edible approvals (poisonous -> edible): "
-        f"{results['dangerous_edible_approvals']}"
-    )
-    print(
-        f"  Unnecessary rejections (edible -> poisonous):     "
-        f"{results['unnecessary_rejections']}"
-    )
-    print(
-        f"  Approved as edible:   {results['approved_edible']}/{total} "
-        f"({results['approved_edible'] / total * 100:.2f}%)"
-    )
-    print(
-        f"  Rejected as poisonous: {results['rejected_poisonous']}/{total} "
-        f"({results['rejected_poisonous'] / total * 100:.2f}%)"
-    )
-    return results
-
-
-# --- Artifacts --------------------------------------------------------------
-
-def save_artifacts(pipeline: Pipeline) -> None:
-    """Save the fitted pipeline and a standalone copy of its encoder."""
-    MODELS_DIR.mkdir(exist_ok=True)
-    joblib.dump(pipeline, MODELS_DIR / "random_forest_model.joblib")
-    encoder = pipeline.named_steps["preprocessor"].named_transformers_["cat"]
-    joblib.dump(encoder, MODELS_DIR / "categorical_encoder.joblib")
-    print(f"\nSaved model and encoder to {MODELS_DIR.relative_to(BASE_DIR)}/")
-
-
-def check_artifacts(pipeline: Pipeline, X_test) -> None:
-    """Reload the saved model and confirm it still predicts correctly."""
-    reloaded = joblib.load(MODELS_DIR / "random_forest_model.joblib")
-    _, original = predict_poisonous(pipeline, X_test.head(5))
-    _, restored = predict_poisonous(reloaded, X_test.head(5))
-    if not (original == restored).all():
-        raise RuntimeError("Reloaded model does not match the trained model.")
-    print("Artifact reload check passed.")
-
-
-# --- Main -------------------------------------------------------------------
-
-def main() -> None:
-    print(
-        "SAFETY NOTICE: educational prototype only. Predictions are not a "
-        "certified food-safety assessment.\n"
-    )
-
-    df = load_data()
-    feature_columns = [c for c in df.columns if c != TARGET]
-
-    X = df[feature_columns]
-    y = df[TARGET].map({"e": 0, "p": 1})
-
-    # Stratified split keeps the edible/poisonous ratio in both sets.
+    show("2. Split: train on 80%, keep 20% aside for the final test")
+    X, y = df[features], df[TARGET].eq("p").astype(int)  # 1 = poisonous
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=TEST_SIZE, stratify=y, random_state=RANDOM_SEED
+        X, y, test_size=0.2, stratify=y, random_state=42
     )
-    print(f"Train: {len(X_train)} rows, Test: {len(X_test)} rows")
+    say(f"train: {len(X_train)} rows, test: {len(X_test)} rows")
 
-    pipeline = build_pipeline(feature_columns)
-    # The encoder is fit only on training data, so the test set cannot leak in.
-    pipeline.fit(X_train, y_train)
+    show("3. A baseline: always predict the majority class")
+    majority = int(y_train.mode()[0])
+    baseline = accuracy_score(y_test, np.full(len(y_test), majority))
+    say(f"accuracy {baseline:.4f} ('{'poisonous' if majority else 'edible'}' for every mushroom)")
 
-    results = evaluate_model(pipeline, X_test, y_test)
-    save_artifacts(pipeline)
-    check_artifacts(pipeline, X_test)
+    show("4. Compare models with 5-fold cross-validation (ROC AUC)")
+    models = candidates()
+    folds = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    scores = {}
+    for name, candidate in models.items():
+        auc = cross_val_score(candidate, X_train, y_train, cv=folds, scoring="roc_auc")
+        scores[name] = float(auc.mean())
+        say(f"{name:<20} ROC AUC {auc.mean():.6f} (+/- {auc.std():.6f})")
+    if algorithm is None:
+        best_name = max(scores, key=scores.get)
+        say(f"-> best: {best_name}")
+    else:
+        best_name = algorithm
+        say(f"-> using {best_name} (chosen with --algorithm)")
+    model = models[best_name]
 
-    print("\n=== Summary ===")
-    print(f"Recall (poisonous): {results['recall']:.6f}")
-    print(f"Dangerous edible approvals: {results['dangerous_edible_approvals']}")
-    print(f"Unnecessary rejections:      {results['unnecessary_rejections']}")
-    print(
-        "Remember: good test scores on this dataset do not prove the model "
-        "is safe for real-world use."
+    show("5. Choose the decision threshold (on training data, never on the test set)")
+    # Probabilities each training row gets from a model that did not see it.
+    oof = cross_val_predict(model, X_train, y_train, cv=folds, method="predict_proba")[:, 1]
+    thresholds = np.round(np.arange(0.1, 0.91, 0.01), 2)
+    f1s = np.array([f1_score(y_train, oof >= t) for t in thresholds])
+    tied = thresholds[np.isclose(f1s, f1s.max(), rtol=0, atol=1e-12)]
+    threshold = float(tied[np.argmin(abs(tied - 0.5))])  # on ties, the one nearest 0.5
+    say(f"threshold {threshold} maximises poisonous F1 ({f1s.max():.4f})")
+
+    show("6. Train on all training data, evaluate once on the test set")
+    model.fit(X_train, y_train)
+    proba = model.predict_proba(X_test)[:, list(model.classes_).index(1)]
+    predicted = (proba >= threshold).astype(int)
+    metrics = {
+        "accuracy": round(accuracy_score(y_test, predicted), 4),
+        "precision": round(precision_score(y_test, predicted, zero_division=0), 4),
+        "recall": round(recall_score(y_test, predicted, zero_division=0), 4),
+        "f1": round(f1_score(y_test, predicted, zero_division=0), 4),
+        "roc_auc": round(roc_auc_score(y_test, proba), 4),
+    }
+    for name, value in metrics.items():
+        say(f"{name:<10} {value:.4f}")
+    tn, fp, fn, tp = confusion_matrix(y_test, predicted, labels=[0, 1]).ravel()
+    say(f"poisonous caught: {tp} of {tp + fn}  <- missed poisonous: {fn} (the dangerous mistake)")
+    say(f"edible wrongly flagged poisonous: {fp} of {fp + tn}")
+
+    show("7. Which features matter (permutation importance on the test set)")
+    importance = permutation_importance(
+        model, X_test, y_test, scoring="roc_auc", n_repeats=3, random_state=42, n_jobs=1
     )
+    ranked = sorted(zip(features, importance.importances_mean, strict=True), key=lambda x: -x[1])
+    for feature, value in ranked[:5]:
+        say(f"{feature:<26} {value:+.4f}")
+
+    show("8. Save the pipeline and metadata for FastAPI")
+    bundle = {
+        "model": model,
+        "algorithm": best_name,
+        "features": features,
+        "threshold": threshold,
+        "metrics": metrics,
+        "cv_scores": scores,
+        "baseline_accuracy": float(baseline),
+        "labels": {"e": "edible", "p": "poisonous"},
+        "trained_at": datetime.now(UTC).isoformat(timespec="seconds"),
+        "sklearn_version": sklearn.__version__,
+    }
+    models_dir.mkdir(parents=True, exist_ok=True)
+    path = models_dir / "mushroom.joblib"
+    joblib.dump(bundle, path)
+    say(f"saved to {path}")
+    return bundle
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train the mushroom model.")
+    parser.add_argument(
+        "--algorithm",
+        choices=ALGORITHMS,
+        help="train this model instead of picking the best by cross-validated ROC AUC",
+    )
+    args = parser.parse_args()
+    train(algorithm=args.algorithm)
